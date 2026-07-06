@@ -101,7 +101,7 @@ requirements:  ## Install/refresh Python project requirements
 .PHONY: requirements-all
 requirements-all:  ## Install/refresh all Python requirements (including those needed for CI tests)
 	$(MAKE) requirements EXTRA_REQUIREMENTS=py-polars/requirements-ci.txt
-	
+
 # We set environment variables which will cause unnecessary re-builds if other cargo commands
 # (not run through maturin/Makefile) are ran. By updating .cargo/config.toml those environment
 # variables are sticky.
