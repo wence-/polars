@@ -1,13 +1,89 @@
 use polars_utils::format_pl_smallstr;
+use recursive::recursive;
 
 use super::*;
+use crate::plans::aexpr::nnf::to_nnf;
 mod predicate_pruning;
-use hive::rewrite_hive;
+use super::hive::rewrite_hive;
 use predicate_pruning::*;
 
 use crate::plans::optimizer::join_utils::remove_suffix;
 
 const IEJOIN_MAX_PREDICATES: usize = 2;
+
+/// Derive a necessary predicate over a subset of columns from a predicate in
+/// negation normal form.
+///
+/// Atoms that cannot be pushed down to the input are replaced by `true`. Since
+/// NNF contains only `And` and `Or` above its possibly-negated atoms, the
+/// resulting expression is implied by the original predicate. It can therefore
+/// be applied before a join as long as the original predicate remains above the
+/// join as a residual. `None` represents a projection that simplifies to
+/// `true`, which is not useful as a filter.
+fn project_nnf<F>(
+    predicate: Node,
+    expr_arena: &mut Arena<AExpr>,
+    mut can_pushdown: F,
+) -> Option<Node>
+where
+    F: FnMut(Node, &Arena<AExpr>) -> bool,
+{
+    let mut cache = PlHashMap::default();
+    project_nnf_impl(predicate, expr_arena, &mut can_pushdown, &mut cache)
+}
+
+#[recursive]
+fn project_nnf_impl<F>(
+    predicate: Node,
+    expr_arena: &mut Arena<AExpr>,
+    can_pushdown: &mut F,
+    cache: &mut PlHashMap<Node, Option<Node>>,
+) -> Option<Node>
+where
+    F: FnMut(Node, &Arena<AExpr>) -> bool,
+{
+    if let Some(&projection) = cache.get(&predicate) {
+        return projection;
+    }
+
+    let projection = if let &AExpr::BinaryExpr { left, op, right } = expr_arena.get(predicate)
+        && matches!(op, Operator::And | Operator::Or)
+    {
+        // Decompose boolean binary expressions and try pushing down both sides
+        let projected_left = project_nnf_impl(left, expr_arena, can_pushdown, cache);
+        let projected_right = project_nnf_impl(right, expr_arena, can_pushdown, cache);
+
+        match (projected_left, op, projected_right) {
+            // true AND x => x, x AND true => x.
+            (None, Operator::And, projection) | (projection, Operator::And, None) => projection,
+
+            // true OR x => true, x OR true => true.
+            (None, Operator::Or, _) | (_, Operator::Or, None) => None,
+
+            (Some(projected_left), op, Some(projected_right)) => {
+                if projected_left == left && projected_right == right {
+                    Some(predicate)
+                } else {
+                    Some(expr_arena.add(AExpr::BinaryExpr {
+                        left: projected_left,
+                        op,
+                        right: projected_right,
+                    }))
+                }
+            },
+            _ => unreachable!(),
+        }
+    } else if !is_inherently_nondeterministic(predicate, expr_arena)
+        && can_pushdown(predicate, expr_arena)
+    {
+        Some(predicate)
+    } else {
+        None
+    };
+
+    cache.insert(predicate, projection);
+    projection
+}
 
 #[allow(clippy::too_many_arguments)]
 pub(super) fn process_join(
@@ -284,11 +360,15 @@ pub(super) fn process_join(
         init_indexmap(Some(acc_predicates.len()));
     let mut local_predicates = Vec::with_capacity(acc_predicates.len());
 
-    for (_, predicate) in acc_predicates {
-        let mut push_left = true;
-        let mut push_right = true;
+    struct CanPushdown {
+        left: bool,
+        right: bool,
+    }
+    let can_pushdown = |node: Node, expr_arena: &Arena<AExpr>| -> CanPushdown {
+        let mut left = true;
+        let mut right = true;
 
-        for col_name in aexpr_to_leaf_names_iter(predicate.node(), expr_arena) {
+        for col_name in aexpr_to_leaf_names_iter(node, expr_arena) {
             let origin: ExprOrigin = ExprOrigin::get_column_origin(
                 col_name.as_str(),
                 &schema_left,
@@ -298,12 +378,21 @@ pub(super) fn process_join(
             )
             .unwrap();
 
-            push_left &= matches!(origin, ExprOrigin::Left | ExprOrigin::None)
+            left &= matches!(origin, ExprOrigin::Left | ExprOrigin::None)
                 || output_key_to_left_input_map.contains_key(col_name);
 
-            push_right &= matches!(origin, ExprOrigin::Right | ExprOrigin::None)
+            right &= matches!(origin, ExprOrigin::Right | ExprOrigin::None)
                 || output_key_to_right_input_map.contains_key(col_name);
         }
+
+        CanPushdown { left, right }
+    };
+
+    for (_, predicate) in acc_predicates {
+        let CanPushdown {
+            left: mut push_left,
+            right: mut push_right,
+        } = can_pushdown(predicate.node(), expr_arena);
 
         // Note: If `push_left` and `push_right` are both `true`, it means the predicate refers only
         // to the join key columns, or the predicate does not refer any columns.
@@ -371,7 +460,66 @@ pub(super) fn process_join(
         };
 
         if has_residual {
-            local_predicates.push(predicate.clone())
+            local_predicates.push(predicate.clone());
+
+            // A predicate that refers to both inputs can still yield a necessary (but not
+            // sufficient) predicate for either input. Retain the original predicate above the
+            // join for correctness and push partial predicates only to sides where filtering
+            // before this join type is semantics-preserving.
+            let (project_left, project_right) = match &options.args.how {
+                JoinType::Inner | JoinType::Cross => (true, true),
+                JoinType::Left => (true, false),
+                JoinType::Right => (false, true),
+                JoinType::Full => (false, false),
+                #[cfg(feature = "asof_join")]
+                JoinType::AsOf(_) => (true, false),
+                #[cfg(feature = "semi_anti_join")]
+                JoinType::Semi => (true, true),
+                #[cfg(feature = "semi_anti_join")]
+                JoinType::Anti => (true, false),
+                #[cfg(feature = "iejoin")]
+                JoinType::IEJoin | JoinType::Range => (true, true),
+            };
+
+            if project_left || project_right {
+                let predicate_nnf = to_nnf(predicate.node(), expr_arena);
+
+                if project_left
+                    && let Some(projection) =
+                        project_nnf(predicate_nnf, expr_arena, |node, expr_arena| {
+                            can_pushdown(node, expr_arena).left
+                        })
+                {
+                    let mut projection = ExprIR::from_node(projection, expr_arena);
+                    map_column_references(
+                        &mut projection,
+                        expr_arena,
+                        &output_key_to_left_input_map,
+                    );
+                    insert_predicate_dedup(&mut pushdown_left, &projection, expr_arena);
+                }
+
+                if project_right
+                    && let Some(projection) =
+                        project_nnf(predicate_nnf, expr_arena, |node, expr_arena| {
+                            can_pushdown(node, expr_arena).right
+                        })
+                {
+                    let mut projection = ExprIR::from_node(projection, expr_arena);
+                    map_column_references(
+                        &mut projection,
+                        expr_arena,
+                        &output_key_to_right_input_map,
+                    );
+                    remove_suffix(
+                        &mut projection,
+                        expr_arena,
+                        &schema_right,
+                        options.args.suffix(),
+                    );
+                    insert_predicate_dedup(&mut pushdown_right, &projection, expr_arena);
+                }
+            }
         }
 
         if push_left {

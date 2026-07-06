@@ -2682,6 +2682,114 @@ def test_join_filter_pushdown_inner_join() -> None:
     assert_frame_equal(q.collect(optimizations=pl.QueryOptFlags.none()), expect)
 
 
+def test_join_filter_pushdown_structural_projection() -> None:
+    lhs = pl.LazyFrame(
+        {
+            "k": [1, 2, 3, 4],
+            "a": [1, 2, 3, 4],
+            "b": [10, 20, 30, 40],
+            "c": [5, 6, 7, 8],
+        }
+    )
+    rhs = pl.LazyFrame(
+        {"k": [1, 2, 3], "x": [100, 200, 300], "y": [1000, 2000, 3000]}
+    )
+
+    q = lhs.join(rhs, on="k").filter(
+        (
+            (pl.col("a") == 1)
+            & (pl.col("b") == 10)
+            & (pl.col("x") == 100)
+            & (pl.col("y") == 1000)
+        )
+        | (
+            (pl.col("a") == 2)
+            & (pl.col("b") == 20)
+            & (pl.col("x") == 200)
+            & (pl.col("y") == 2000)
+        )
+    )
+
+    plan_parts = _extract_plan_joins_and_filters(q.explain())
+    assert len(plan_parts) == 5
+
+    # The original mixed-input predicate remains above the join.
+    assert all(f'col("{name}")' in plan_parts[0] for name in ("a", "b", "x", "y"))
+
+    # Each input receives its side-local necessary predicate. Keep terms from
+    # each branch together so correlations are not lost.
+    assert plan_parts[1] == 'LEFT PLAN ON: [col("k")]'
+    assert all(f'col("{name}")' in plan_parts[2] for name in ("a", "b"))
+    assert all(f'col("{name}")' not in plan_parts[2] for name in ("x", "y"))
+    assert " | " in plan_parts[2]
+
+    assert plan_parts[3] == 'RIGHT PLAN ON: [col("k")]'
+    assert all(f'col("{name}")' in plan_parts[4] for name in ("x", "y"))
+    assert all(f'col("{name}")' not in plan_parts[4] for name in ("a", "b"))
+    assert " | " in plan_parts[4]
+
+    _assert_matches_without_predicate_pushdown(q)
+
+    # A projected branch with no RHS terms is `true`, so there is no useful RHS
+    # predicate. This is also important for left joins: filtering the non-preserved
+    # input can create a null-extended row that passes the residual.
+    q = lhs.join(rhs, on="k", how="left").filter(
+        ((pl.col("a") == 1) & (pl.col("x") == 100)) | (pl.col("a") == 4)
+    )
+
+    plan_parts = _extract_plan_joins_and_filters(q.explain())
+    assert len(plan_parts) == 4
+    assert plan_parts[1] == 'LEFT PLAN ON: [col("k")]'
+    assert 'col("a")' in plan_parts[2]
+    assert " | " in plan_parts[2]
+    assert plan_parts[3] == 'RIGHT PLAN ON: [col("k")]'
+
+    _assert_matches_without_predicate_pushdown(q)
+
+    # This expression is not in DNF. Structural projection retains the nested
+    # LHS disjunction instead of dropping the entire mixed-input subexpression.
+    q = lhs.join(rhs, on="k").filter(
+        (
+            (
+                (pl.col("a") == 1)
+                | ((pl.col("b") == 20) & (pl.col("x") == 100))
+            )
+            & (pl.col("c") <= 6)
+        )
+        | ((pl.col("a") == 3) & (pl.col("y") == 3000))
+    )
+
+    plan_parts = _extract_plan_joins_and_filters(q.explain())
+    assert len(plan_parts) == 4
+    assert all(
+        f'col("{name}")' in plan_parts[0] for name in ("a", "b", "c", "x", "y")
+    )
+    assert plan_parts[1] == 'LEFT PLAN ON: [col("k")]'
+    # The old DNF-specific projection dropped the mixed `(a OR (b AND x))`
+    # subtree entirely, so `b` was absent from this input filter.
+    assert all(f'col("{name}")' in plan_parts[2] for name in ("a", "b", "c"))
+    assert all(f'col("{name}")' not in plan_parts[2] for name in ("x", "y"))
+    assert plan_parts[3] == 'RIGHT PLAN ON: [col("k")]'
+
+    _assert_matches_without_predicate_pushdown(q)
+
+    # NNF exposes a useful LHS predicate through an outer negation:
+    # NOT((a OR x) AND b) -> (NOT(a) AND NOT(x)) OR NOT(b).
+    q = lhs.join(rhs, on="k").filter(
+        ~(((pl.col("a") == 1) | (pl.col("x") == 100)) & (pl.col("b") == 20))
+    )
+
+    plan_parts = _extract_plan_joins_and_filters(q.explain())
+    assert len(plan_parts) == 4
+    assert all(f'col("{name}")' in plan_parts[0] for name in ("a", "b", "x"))
+    assert plan_parts[1] == 'LEFT PLAN ON: [col("k")]'
+    assert all(f'col("{name}")' in plan_parts[2] for name in ("a", "b"))
+    assert 'col("x")' not in plan_parts[2]
+    assert plan_parts[3] == 'RIGHT PLAN ON: [col("k")]'
+
+    _assert_matches_without_predicate_pushdown(q)
+
+
 def test_join_filter_pushdown_left_join() -> None:
     lhs = pl.LazyFrame(
         {"a": [1, 2, 3, 4, 5], "b": [1, 2, 3, 4, None], "c": ["a", "b", "c", "d", "e"]}

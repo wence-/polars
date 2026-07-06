@@ -6,8 +6,6 @@ pub(crate) mod filter_constraint;
 mod function_expr;
 mod hash;
 mod minterm_iter;
-// Standalone utility for predicate projection; its optimizer call site is added separately.
-#[allow(dead_code)]
 pub(crate) mod nnf;
 pub(crate) mod or_factoring;
 pub mod predicates;
