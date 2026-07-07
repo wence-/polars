@@ -15,6 +15,7 @@ from polars.testing.asserts.series import assert_series_equal
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
+    from pathlib import Path
 
     from tests.conftest import PlMonkeyPatch
 
@@ -1591,6 +1592,67 @@ def test_filter_contradiction_collapses() -> None:
     assert_frame_equal(
         q.select("a", "b").collect(),
         pl.DataFrame({"a": [None], "b": [None]}, schema={"a": pl.Int64, "b": pl.Int64}),
+    )
+
+
+def test_filter_range_merge(tmp_path: Path) -> None:
+    x = pl.col("x")
+    lf = pl.LazyFrame({"x": [-1, 1, 3, 5, 8, 10, 11, None]})
+
+    # Each AND first becomes an interval. Their transitive overlaps then allow
+    # the surrounding OR to become one interval too. The intervals are written
+    # out of order to exercise the sort before the linear union pass.
+    predicate = (
+        x.is_between(7, 10)
+        | ((x >= 1) & (x <= 4))
+        | ((x >= 3) & (x < 8))
+    )
+    q = lf.filter(predicate)
+    plan = q.explain()
+    assert plan.count("is_between") == 1
+    assert "is_between([1, 10])" in plan
+    assert_frame_equal(q.collect(), pl.DataFrame({"x": [1, 3, 5, 8, 10]}))
+
+    # The expression optimizer also sees selections already attached to scans.
+    path = tmp_path / "ranges.parquet"
+    lf.collect().write_parquet(path)
+    scan_plan = pl.scan_parquet(path).filter(predicate).explain()
+    assert 'SELECTION: col("x").is_between([1, 10])' in scan_plan
+
+    # A disjoint union has no single interval representation and is retained.
+    disjoint = lf.filter(x.is_between(1, 3) | x.is_between(8, 10))
+    assert disjoint.explain().count("is_between") == 2
+
+    # Ranges touching at a point can merge if either interval contains that
+    # point. If both exclude it, the union remains disjoint.
+    touching = x.is_between(1, 3, closed="none") | x.is_between(
+        3, 10, closed="both"
+    )
+    assert lf.select(touching).explain().count("is_between") == 1
+    missing_point = x.is_between(1, 3, closed="none") | x.is_between(
+        3, 10, closed="none"
+    )
+    assert lf.select(missing_point).explain().count("is_between") == 2
+
+    # An included lower endpoint sorts before an excluded endpoint at the same
+    # value, allowing the middle interval to bridge both open ranges.
+    bridged = (
+        x.is_between(-10, 0, closed="left")
+        | x.is_between(0, 10, closed="right")
+        | x.is_between(0, 5, closed="both")
+    )
+    bridged_plan = lf.select(bridged).explain()
+    assert bridged_plan.count("is_between") == 1
+    assert "is_between([-10, 10])" in bridged_plan
+
+    # Outside filter context, an empty interval must still produce null for a
+    # null input rather than being replaced with literal false.
+    empty = lf.select(((x > 10) & (x < 1)).alias("empty"))
+    assert_frame_equal(
+        empty.collect(),
+        pl.DataFrame(
+            {"empty": [False, False, False, False, False, False, False, None]}
+        ),
     )
 
 

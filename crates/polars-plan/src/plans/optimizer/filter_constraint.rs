@@ -1,8 +1,9 @@
 use polars_core::error::PolarsResult;
+use polars_core::schema::Schema;
 use polars_utils::arena::{Arena, Node};
 
-use super::OptimizationRule;
-use crate::plans::aexpr::filter_constraint::merge_filter_constraints;
+use super::{OptimizationRule, OptimizeExprContext};
+use crate::plans::aexpr::filter_constraint::{merge_filter_constraints, simplify_filter_expr};
 use crate::prelude::{AExpr, IR};
 
 pub struct FilterConstraintRule {
@@ -10,6 +11,16 @@ pub struct FilterConstraintRule {
 }
 
 impl OptimizationRule for FilterConstraintRule {
+    fn optimize_expr(
+        &mut self,
+        expr_arena: &mut Arena<AExpr>,
+        expr_node: Node,
+        _schema: &Schema,
+        _ctx: OptimizeExprContext,
+    ) -> PolarsResult<Option<AExpr>> {
+        Ok(simplify_filter_expr(expr_node, expr_arena))
+    }
+
     fn optimize_plan(
         &mut self,
         lp_arena: &mut Arena<IR>,
