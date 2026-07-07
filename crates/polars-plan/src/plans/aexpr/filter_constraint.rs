@@ -14,18 +14,20 @@
 //!    tightest rebuilt chain, or `None` if unchanged.
 
 use std::cmp::Ordering;
+use std::ops::Bound::{self, Excluded, Included, Unbounded};
 
 #[cfg(feature = "is_in")]
 use polars_core::prelude::{AnyValue, Series};
 use polars_core::scalar::Scalar;
-use polars_utils::aliases::{InitHashMaps, PlIndexMap, PlIndexSet};
+use polars_utils::aliases::{InitHashMaps, PlHashMap, PlIndexMap, PlIndexSet};
 use polars_utils::arena::{Arena, Node};
 use polars_utils::pl_str::PlSmallStr;
+use polars_utils::unitvec;
 
 use super::properties::ExprPushdownGroup;
 use super::{AExpr, IRBooleanFunction, IRFunctionExpr, LiteralValue, MintermIter, Operator};
 #[cfg(feature = "is_between")]
-use crate::prelude::ClosedInterval;
+use crate::prelude::{ClosedInterval, ExprIR};
 
 // How a single conjunct in the `AND` chain was classified.
 enum Classification {
@@ -82,6 +84,510 @@ fn scalar_cmp(a: &Scalar, b: &Scalar) -> Option<Ordering> {
         return None;
     }
     a.as_any_value().partial_cmp(&b.as_any_value())
+}
+
+#[derive(Clone)]
+struct Interval {
+    lower: Bound<Scalar>,
+    upper: Bound<Scalar>,
+}
+
+struct ColumnInterval {
+    column: PlSmallStr,
+    column_node: Node,
+    interval: Interval,
+}
+
+fn compare_interval_scalars(left: &Scalar, right: &Scalar) -> Ordering {
+    scalar_cmp(left, right).expect("range bounds must be comparable after type coercion")
+}
+
+impl Interval {
+    fn intersection(&self, other: &Self) -> Self {
+        let lower = tighten_bound(&self.lower, &other.lower, compare_interval_scalars);
+        let upper = tighten_bound(&self.upper, &other.upper, |left, right| {
+            compare_interval_scalars(left, right).reverse()
+        });
+        Self { lower, upper }
+    }
+
+    /// Returns the union when the two intervals form one contiguous interval.
+    /// A union spanning the entire domain is left alone: there is no range
+    /// expression for "every non-null value" that preserves null propagation.
+    fn union(&self, other: &Self) -> Option<Self> {
+        if self.is_empty() {
+            return Some(other.clone());
+        }
+        if other.is_empty() {
+            return Some(self.clone());
+        }
+        if self.is_disjoint_from(other) {
+            return None;
+        }
+
+        let lower = loosen_bound(&self.lower, &other.lower, compare_interval_scalars);
+        let upper = loosen_bound(&self.upper, &other.upper, |left, right| {
+            compare_interval_scalars(left, right).reverse()
+        });
+        if matches!((&lower, &upper), (Unbounded, Unbounded)) {
+            return None;
+        }
+        Some(Self { lower, upper })
+    }
+
+    fn is_empty(&self) -> bool {
+        let (Some(lower), Some(upper)) = (bound_value(&self.lower), bound_value(&self.upper))
+        else {
+            return false;
+        };
+        match compare_interval_scalars(lower, upper) {
+            Ordering::Greater => true,
+            Ordering::Less => false,
+            Ordering::Equal => !(is_included(&self.lower) && is_included(&self.upper)),
+        }
+    }
+
+    fn is_disjoint_from(&self, other: &Self) -> bool {
+        let is_strictly_before = |left: &Self, right: &Self| {
+            let (Some(upper), Some(lower)) = (bound_value(&left.upper), bound_value(&right.lower))
+            else {
+                return false;
+            };
+            match compare_interval_scalars(upper, lower) {
+                Ordering::Greater => false,
+                Ordering::Less => true,
+                Ordering::Equal => !(is_included(&left.upper) || is_included(&right.lower)),
+            }
+        };
+
+        is_strictly_before(self, other) || is_strictly_before(other, self)
+    }
+}
+
+fn tighten_bound(
+    left: &Bound<Scalar>,
+    right: &Bound<Scalar>,
+    cmp: impl FnOnce(&Scalar, &Scalar) -> Ordering,
+) -> Bound<Scalar> {
+    match (left, right) {
+        (Unbounded, bound) | (bound, Unbounded) => bound.clone(),
+        (left @ (Included(lv) | Excluded(lv)), right @ (Included(rv) | Excluded(rv))) => {
+            match cmp(lv, rv) {
+                Ordering::Less => right.clone(),
+                Ordering::Greater => left.clone(),
+                Ordering::Equal if is_included(left) && is_included(right) => left.clone(),
+                Ordering::Equal => Excluded(lv.clone()),
+            }
+        },
+    }
+}
+
+fn loosen_bound(
+    left: &Bound<Scalar>,
+    right: &Bound<Scalar>,
+    cmp: impl FnOnce(&Scalar, &Scalar) -> Ordering,
+) -> Bound<Scalar> {
+    match (left, right) {
+        (Unbounded, _) | (_, Unbounded) => Unbounded,
+        (left @ (Included(lv) | Excluded(lv)), right @ (Included(rv) | Excluded(rv))) => {
+            match cmp(lv, rv) {
+                Ordering::Less => left.clone(),
+                Ordering::Greater => right.clone(),
+                Ordering::Equal if is_included(left) || is_included(right) => Included(lv.clone()),
+                Ordering::Equal => left.clone(),
+            }
+        },
+    }
+}
+
+#[inline(always)]
+fn bound_value(bound: &Bound<Scalar>) -> Option<&Scalar> {
+    match bound {
+        Included(value) | Excluded(value) => Some(value),
+        Unbounded => None,
+    }
+}
+
+#[inline(always)]
+fn is_included(bound: &Bound<Scalar>) -> bool {
+    matches!(bound, Included(_))
+}
+
+/// Simplify the ranges directly below an AND or OR expression. The optimizer
+/// calls this bottom-up (and to a fixed point), so an AND such as
+/// `x >= 1 AND x <= 10` first becomes one interval, which can then participate
+/// in a surrounding OR on the next pass.
+///
+/// These rewrites preserve the value of the boolean expression, including its
+/// nulls. In particular an empty intersection is represented by an empty
+/// `is_between`, rather than by literal false. The latter is only equivalent in
+/// predicate context and remains the job of `merge_filter_constraints`.
+pub(crate) fn simplify_filter_expr(node: Node, expr_arena: &mut Arena<AExpr>) -> Option<AExpr> {
+    let op = match expr_arena.get(node) {
+        AExpr::BinaryExpr {
+            op: op @ (Operator::And | Operator::LogicalAnd | Operator::Or | Operator::LogicalOr),
+            ..
+        } => *op,
+        _ => return None,
+    };
+
+    let mut terms = Vec::new();
+    collect_interval_terms(node, op, expr_arena, &mut terms);
+    if terms.len() < 2 {
+        return None;
+    }
+
+    if matches!(op, Operator::And | Operator::LogicalAnd) {
+        simplify_intersections(terms, op, expr_arena)
+    } else {
+        simplify_unions(terms, op, expr_arena)
+    }
+}
+
+struct IntervalTerm {
+    node: Node,
+    interval_group: Option<usize>,
+}
+
+fn collect_interval_terms(
+    root: Node,
+    op: Operator,
+    expr_arena: &Arena<AExpr>,
+    out: &mut Vec<IntervalTerm>,
+) {
+    let mut stack = unitvec![root];
+    while let Some(node) = stack.pop() {
+        match expr_arena.get(node) {
+            AExpr::BinaryExpr {
+                left,
+                op: node_op,
+                right,
+            } if *node_op == op => {
+                stack.push(*right);
+                stack.push(*left);
+            },
+            _ => out.push(IntervalTerm {
+                node,
+                interval_group: None,
+            }),
+        }
+    }
+}
+
+struct IntervalGroup {
+    column_node: Node,
+    first_index: usize,
+    intervals: Vec<Interval>,
+    replacements: Option<Vec<Node>>,
+}
+
+fn group_intervals(terms: &mut [IntervalTerm], expr_arena: &Arena<AExpr>) -> Vec<IntervalGroup> {
+    let mut group_indices = PlHashMap::new();
+    let mut groups = Vec::new();
+    for (index, term) in terms.iter_mut().enumerate() {
+        let Some(ColumnInterval {
+            column,
+            column_node,
+            interval,
+        }) = as_column_interval(term.node, expr_arena)
+        else {
+            continue;
+        };
+        let group_index = *group_indices.entry(column).or_insert_with(|| {
+            let group_index = groups.len();
+            groups.push(IntervalGroup {
+                column_node,
+                first_index: index,
+                intervals: Vec::new(),
+                replacements: None,
+            });
+            group_index
+        });
+        term.interval_group = Some(group_index);
+        groups[group_index].intervals.push(interval);
+    }
+    groups
+}
+
+fn simplify_intersections(
+    mut terms: Vec<IntervalTerm>,
+    op: Operator,
+    expr_arena: &mut Arena<AExpr>,
+) -> Option<AExpr> {
+    let mut groups = group_intervals(&mut terms, expr_arena);
+    let mut changed = false;
+
+    for group in &mut groups {
+        if group.intervals.len() < 2 {
+            continue;
+        }
+
+        let intersection = std::mem::take(&mut group.intervals).into_iter().fold(
+            Interval {
+                lower: Unbounded,
+                upper: Unbounded,
+            },
+            |a, b| a.intersection(&b),
+        );
+
+        group.replacements = interval_to_node(group.column_node, intersection, expr_arena)
+            .map(|replacement| vec![replacement]);
+        changed |= group.replacements.is_some();
+    }
+
+    changed.then(|| rebuild_interval_terms(terms, &groups, op, expr_arena))
+}
+
+fn simplify_unions(
+    mut terms: Vec<IntervalTerm>,
+    op: Operator,
+    expr_arena: &mut Arena<AExpr>,
+) -> Option<AExpr> {
+    let mut groups = group_intervals(&mut terms, expr_arena);
+    let mut changed = false;
+
+    let union = |intervals: &mut Vec<Interval>| {
+        intervals.sort_unstable_by(|left, right| match (&left.lower, &right.lower) {
+            (Unbounded, Unbounded) => Ordering::Equal,
+            (Unbounded, _) => Ordering::Less,
+            (_, Unbounded) => Ordering::Greater,
+            (
+                left_bound @ (Included(lv) | Excluded(lv)),
+                right_bound @ (Included(rv) | Excluded(rv)),
+            ) => compare_interval_scalars(lv, rv).then_with(|| match (left_bound, right_bound) {
+                (Included(_), Excluded(_)) => Ordering::Less,
+                (Excluded(_), Included(_)) => Ordering::Greater,
+                _ => Ordering::Equal,
+            }),
+        });
+        intervals.dedup_by(|right, left| {
+            if let Some(union) = left.union(right) {
+                *left = union;
+                true
+            } else {
+                false
+            }
+        });
+    };
+
+    for group in &mut groups {
+        if group.intervals.len() < 2 {
+            continue;
+        }
+
+        let original_len = group.intervals.len();
+        union(&mut group.intervals);
+        if group.intervals.len() == original_len {
+            continue;
+        }
+
+        group.replacements = std::mem::take(&mut group.intervals)
+            .into_iter()
+            .map(|interval| interval_to_node(group.column_node, interval, expr_arena))
+            .collect();
+        changed |= group.replacements.is_some();
+    }
+
+    changed.then(|| rebuild_interval_terms(terms, &groups, op, expr_arena))
+}
+
+fn rebuild_interval_terms(
+    terms: Vec<IntervalTerm>,
+    groups: &[IntervalGroup],
+    op: Operator,
+    expr_arena: &mut Arena<AExpr>,
+) -> AExpr {
+    let mut rebuilt = Vec::with_capacity(terms.len());
+    for (index, term) in terms.into_iter().enumerate() {
+        if let Some(group) = term.interval_group.map(|group_index| &groups[group_index])
+            && let Some(replacements) = &group.replacements
+        {
+            if index == group.first_index {
+                rebuilt.extend(replacements.iter().copied());
+            }
+        } else {
+            rebuilt.push(term.node);
+        }
+    }
+
+    let mut nodes = rebuilt.into_iter();
+    let mut root = nodes.next().expect("range simplification kept no terms");
+    for right in nodes {
+        root = expr_arena.add(AExpr::BinaryExpr {
+            left: root,
+            op,
+            right,
+        });
+    }
+    expr_arena.get(root).clone()
+}
+
+fn as_column_interval(node: Node, expr_arena: &Arena<AExpr>) -> Option<ColumnInterval> {
+    match expr_arena.get(node) {
+        AExpr::BinaryExpr { left, op, right } => {
+            let (column, column_node, value, op) = if let (Some(column), Some(value)) = (
+                as_column(expr_arena.get(*left)),
+                as_scalar_lit(expr_arena.get(*right)),
+            ) {
+                (column, *left, value, *op)
+            } else if let (Some(value), Some(column)) = (
+                as_scalar_lit(expr_arena.get(*left)),
+                as_column(expr_arena.get(*right)),
+            ) {
+                (column, *right, value, op.swap_operands()?)
+            } else {
+                return None;
+            };
+
+            let interval = match op {
+                Operator::Gt => Interval {
+                    lower: Excluded(value),
+                    upper: Unbounded,
+                },
+                Operator::GtEq => Interval {
+                    lower: Included(value),
+                    upper: Unbounded,
+                },
+                Operator::Lt => Interval {
+                    lower: Unbounded,
+                    upper: Excluded(value),
+                },
+                Operator::LtEq => Interval {
+                    lower: Unbounded,
+                    upper: Included(value),
+                },
+                Operator::Eq => Interval {
+                    lower: Included(value.clone()),
+                    upper: Included(value),
+                },
+                _ => return None,
+            };
+            Some(ColumnInterval {
+                column,
+                column_node,
+                interval,
+            })
+        },
+        #[cfg(feature = "is_between")]
+        AExpr::Function {
+            input,
+            function: IRFunctionExpr::Boolean(IRBooleanFunction::IsBetween { closed }),
+            ..
+        } => {
+            let [column_expr, lower_expr, upper_expr] = input.as_slice() else {
+                return None;
+            };
+            let column_node = column_expr.node();
+            let column = as_column(expr_arena.get(column_node))?;
+            let lower = as_scalar_lit(expr_arena.get(lower_expr.node()))?;
+            let upper = as_scalar_lit(expr_arena.get(upper_expr.node()))?;
+            let (lower, upper) = bounds_from_closed(lower, upper, *closed);
+            Some(ColumnInterval {
+                column,
+                column_node,
+                interval: Interval { lower, upper },
+            })
+        },
+        _ => None,
+    }
+}
+
+fn interval_to_node(
+    column_node: Node,
+    interval: Interval,
+    expr_arena: &mut Arena<AExpr>,
+) -> Option<Node> {
+    let is_singleton = match (&interval.lower, &interval.upper) {
+        (Included(lower), Included(upper)) => {
+            compare_interval_scalars(lower, upper) == Ordering::Equal
+        },
+        _ => false,
+    };
+    let lower_node = bound_value(&interval.lower)
+        .map(|value| expr_arena.add(AExpr::Literal(LiteralValue::Scalar(value.clone()))));
+    let upper_node = bound_value(&interval.upper)
+        .map(|value| expr_arena.add(AExpr::Literal(LiteralValue::Scalar(value.clone()))));
+
+    match (interval.lower, lower_node, interval.upper, upper_node) {
+        (lower, Some(lower_node), upper, Some(upper_node)) => {
+            if is_singleton {
+                return Some(expr_arena.add(AExpr::BinaryExpr {
+                    left: column_node,
+                    op: Operator::Eq,
+                    right: lower_node,
+                }));
+            }
+
+            #[cfg(not(feature = "is_between"))]
+            let _ = (&lower, &upper, upper_node);
+            #[cfg(feature = "is_between")]
+            {
+                let closed = closed_from_bounds(&lower, &upper);
+                let function = IRFunctionExpr::Boolean(IRBooleanFunction::IsBetween { closed });
+                let options = function.function_options();
+                return Some(expr_arena.add(AExpr::Function {
+                    input: vec![
+                        ExprIR::from_node(column_node, expr_arena),
+                        ExprIR::from_node(lower_node, expr_arena),
+                        ExprIR::from_node(upper_node, expr_arena),
+                    ],
+                    function,
+                    options,
+                }));
+            }
+            #[cfg(not(feature = "is_between"))]
+            {
+                // Rebuilding this as the same pair of comparisons would make
+                // the fixed-point optimizer rediscover it indefinitely.
+                None
+            }
+        },
+        (lower, Some(lower_node), Unbounded, None) => Some(expr_arena.add(AExpr::BinaryExpr {
+            left: column_node,
+            op: if is_included(&lower) {
+                Operator::GtEq
+            } else {
+                Operator::Gt
+            },
+            right: lower_node,
+        })),
+        (Unbounded, None, upper, Some(upper_node)) => Some(expr_arena.add(AExpr::BinaryExpr {
+            left: column_node,
+            op: if is_included(&upper) {
+                Operator::LtEq
+            } else {
+                Operator::Lt
+            },
+            right: upper_node,
+        })),
+        (Unbounded, None, Unbounded, None) => None,
+        _ => unreachable!(),
+    }
+}
+
+#[cfg(feature = "is_between")]
+fn bounds_from_closed(
+    lower: Scalar,
+    upper: Scalar,
+    closed: ClosedInterval,
+) -> (Bound<Scalar>, Bound<Scalar>) {
+    match closed {
+        ClosedInterval::Both => (Included(lower), Included(upper)),
+        ClosedInterval::Left => (Included(lower), Excluded(upper)),
+        ClosedInterval::Right => (Excluded(lower), Included(upper)),
+        ClosedInterval::None => (Excluded(lower), Excluded(upper)),
+    }
+}
+
+#[cfg(feature = "is_between")]
+fn closed_from_bounds(lower: &Bound<Scalar>, upper: &Bound<Scalar>) -> ClosedInterval {
+    match (lower, upper) {
+        (Included(_), Included(_)) => ClosedInterval::Both,
+        (Included(_), Excluded(_)) => ClosedInterval::Left,
+        (Excluded(_), Included(_)) => ClosedInterval::Right,
+        (Excluded(_), Excluded(_)) => ClosedInterval::None,
+        _ => unreachable!("is_between requires bounded endpoints"),
+    }
 }
 
 // `PlIndexSet` (not a hash set) keeps insertion order so the rebuilt conjuncts stay
@@ -892,7 +1398,6 @@ fn as_column(ae: &AExpr) -> Option<PlSmallStr> {
 }
 
 // Returns `None` for a null literal, so we only reason about real values.
-#[cfg(feature = "is_between")]
 fn as_scalar_lit(ae: &AExpr) -> Option<Scalar> {
     if let AExpr::Literal(LiteralValue::Scalar(s)) = ae {
         if s.is_null() {
