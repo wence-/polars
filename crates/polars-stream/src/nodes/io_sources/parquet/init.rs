@@ -10,7 +10,7 @@ use polars_io::prelude::ParallelStrategy;
 use polars_utils::IdxSize;
 
 use super::row_group_data_fetch::RowGroupDataFetcher;
-use super::row_group_decode::RowGroupDecoder;
+use super::row_group_decode::{AdaptivePredicateState, RowGroupDecoder};
 use super::{AsyncTaskData, ParquetReadImpl};
 use crate::morsel::{Morsel, SourceToken, get_ideal_morsel_size};
 use crate::nodes::io_sources::multi_scan::reader_interface::output::FileReaderOutputSend;
@@ -366,6 +366,20 @@ impl ParquetReadImpl {
                     || matches!(x, ArrowFieldProjection::Mapped { .. })
             });
 
+        let adaptive_predicate_state = (allow_column_predicates
+            && predicate_field_indices.len() >= 2
+            && std::env::var("POLARS_PQ_ADAPTIVE_PREDICATE_DECODE").as_deref() == Ok("1"))
+        .then(|| {
+            Arc::new(AdaptivePredicateState::new(
+                predicate_field_indices.len(),
+                self.verbose,
+            ))
+        });
+
+        if adaptive_predicate_state.is_some() && self.verbose {
+            eprintln!("[ParquetFileReader]: Adaptive predicate decode enabled");
+        }
+
         RowGroupDecoder {
             num_pipelines: self.config.num_pipelines,
             projected_arrow_fields,
@@ -376,6 +390,7 @@ impl ParquetReadImpl {
             predicate_field_indices,
             non_predicate_field_indices,
             target_values_per_thread,
+            adaptive_predicate_state,
         }
     }
 }

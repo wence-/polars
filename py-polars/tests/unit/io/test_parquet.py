@@ -1891,6 +1891,46 @@ def test_general_prefiltering(df: pl.DataFrame) -> None:
     assert_frame_equal(result, df.filter(expr))
 
 
+def test_adaptive_predicate_decode(
+    tmp_path: Path,
+    plmonkeypatch: PlMonkeyPatch,
+    capfd: pytest.CaptureFixture[str],
+) -> None:
+    num_rows = 100_000
+    expensive_values = ["needle-" + "x" * 64, "other-" + "y" * 64, None]
+    df = pl.DataFrame(
+        {
+            "seed_a": pl.int_range(0, num_rows, eager=True) % 10 == 0,
+            "seed_b": pl.int_range(0, num_rows, eager=True) % 100 < 10,
+            "expensive": (expensive_values * ((num_rows + 2) // 3))[:num_rows],
+            "payload": pl.int_range(0, num_rows, eager=True),
+        }
+    )
+    path = tmp_path / "adaptive-predicate.parquet"
+    df.write_parquet(path, row_group_size=1_000)
+
+    predicate = (
+        pl.col("seed_a")
+        & pl.col("seed_b")
+        & pl.col("expensive").str.contains("^needle")
+    )
+    expected = df.filter(predicate)
+
+    plmonkeypatch.setenv("POLARS_PQ_ADAPTIVE_PREDICATE_DECODE", "1")
+    plmonkeypatch.setenv("POLARS_VERBOSE", "1")
+    capfd.readouterr()
+    result = (
+        pl.scan_parquet(path, parallel="prefiltered")
+        .filter(predicate)
+        .collect(engine="streaming")
+    )
+    capture = capfd.readouterr().err
+
+    assert_frame_equal(result, expected)
+    assert "[ParquetFileReader]: Adaptive predicate decode enabled" in capture
+    assert "[ParquetFileReader]: Adaptive predicate masked" in capture
+
+
 @given(
     df=dataframes(
         min_size=0,
