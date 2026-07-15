@@ -112,6 +112,7 @@ update-cargo-env: $(VENV_BIN)/python
 .PHONY: build
 build: update-cargo-env ## Compile and install Python Polars for development
 	@unset CONDA_PREFIX \
+	&& unset RUSTC_WRAPPER \
 	&& $(VENV_BIN)/maturin develop -m $(RUNTIME_CARGO_TOML) --features backtrace_filter $(ARGS) --uv \
 	$(FILTER_PIP_WARNINGS)
 
@@ -124,6 +125,7 @@ build-mindebug: update-cargo-env  ## Same as build, but don't include full debug
 .PHONY: build-release
 build-release: update-cargo-env  ## Compile and install Python Polars binary with optimizations, with minimal debug symbols
 	@unset CONDA_PREFIX \
+	&& unset RUSTC_WRAPPER \
 	&& $(VENV_BIN)/maturin develop -m $(RUNTIME_CARGO_TOML) --features backtrace_filter --release $(ARGS) --uv \
 	$(FILTER_PIP_WARNINGS)
 
@@ -147,14 +149,17 @@ build-dist-release: update-cargo-env  ## Compile and install Python Polars binar
 
 .PHONY: check
 check: update-cargo-env ## Run cargo check with all features
-	cargo check --workspace --all-targets --all-features
+	@unset RUSTC_WRAPPER \
+	&& cargo check --workspace --all-targets --all-features
 
 .PHONY: clippy
 clippy: update-cargo-env ## Run clippy with all features
+	unset RUSTC_WRAPPER && \
 	python3 tools/cargo-fail-warning.py clippy --workspace --all-targets --all-features --locked -- -W clippy::dbg_macro
 
 .PHONY: clippy-default
 clippy-default: update-cargo-env ## Run clippy with default features
+	unset RUSTC_WRAPPER && \
 	python3 tools/cargo-fail-warning.py clippy --all-targets --locked -- -W clippy::dbg_macro
 
 .PHONY: fmt
